@@ -1,0 +1,406 @@
+---
+title: "Stock Market Calculator"
+runtime: shiny
+output: html_document
+---
+
+## Project 4: Using Wikipedia Data to Predict Stock Prizes
+
+Team Members:
+
+-   Mateo Bandala Jacques \| abandal1\@jh.edu
+
+-   María Camila Restrepo \| mrestre\@jh.edu
+
+-   Mitali Joshi \| mjoshi13\@jh.edu
+
+# Setup
+
+```{r}
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("httr")) install.packages("httr")
+if (!require("jsonlite")) install.packages("jsonlite")
+if (!require("quantmod")) install.packages("quantmod")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("caret")) install.packages("caret")
+if (!require("shiny")) install.packages("shiny")
+if (!require("rsconnect")) install.packages("rsconnect")
+
+library(httr)
+library(jsonlite)
+library(quantmod)
+library(dplyr)
+library(caret)
+library(tidyverse)
+library(shiny)
+library(rsconnect)
+
+
+```
+
+::: callout-note
+## First, we will build and validate the predictive model that will go in our user interface
+:::
+
+# Part 1: Train and test a machine learning algorithm to predict stock prizes
+
+## Set-up the functions to extract the data
+
+```{r}
+
+# First, we will create a function to get the wikipedia page views
+
+get_wiki_pageviews <- function(page, start_date, end_date) {                # Input page and dates
+  page <- gsub(" ", "_", page)  # Fix the URL name
+  url <- paste0(
+    "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/",
+    "en.wikipedia/all-access/all-agents/", page, "/daily/",
+    format(as.Date(start_date), "%Y%m%d"), "/", format(as.Date(end_date), "%Y%m%d")
+  )
+  
+  response <- GET(url)
+  
+  if (status_code(response) == 200) {      #200 is the succesful response
+    # Parse the JSON response
+    parsed_data <- fromJSON(content(response, "text", encoding = "UTF-8"))   #Encoding 
+    
+    # This extracts a datframe
+    items <- parsed_data$items
+    
+    # Some data wrangling from the above step
+    df <- items %>%
+      dplyr::mutate(
+        Date = as.Date(substr(timestamp, 1, 8), "%Y%m%d")  # convert to date for the dataframe
+      ) %>%
+      dplyr::select(Date, views) %>%
+      dplyr::rename(Pageviews = views)  # 
+    
+    return(df)
+  } else {
+    stop("Failed to retrieve Wikipedia page views. HTTP status: ", status_code(response))
+  }
+}
+
+
+#Simple tests
+
+get_wiki_pageviews("Tesla, Inc.", "2024-09-01" ,"2024-09-06")
+get_wiki_pageviews("Donald Trump", "2024-09-01" ,"2024-09-06")
+get_wiki_pageviews("Chihuahua_(state)", "2024-09-01" ,"2024-09-06") #Mateo's home state :)
+get_wiki_pageviews("Medellín", "2024-09-01" ,"2024-09-06") #Camila's home city, which of course has more views than Chihuahua
+get_wiki_pageviews("Raleigh,_North_Carolina", "2024-09-01" ,"2024-09-06") #And mitali's (Mitali wins)
+
+
+# Now pull the stock (ticker) data from YAHOO
+get_stock_data <- function(ticker, start_date, end_date) {
+  stock_data <- getSymbols(
+    ticker, src = "yahoo", from = as.Date(start_date), to = as.Date(end_date),
+    auto.assign = FALSE
+  )
+  stock_df <- data.frame(
+    Date = index(stock_data),
+    Stock_Close = as.numeric(Cl(stock_data))
+  )
+  return(stock_df)
+}
+
+
+#Some more simple tests for this
+
+get_stock_data("TSLA", "2024-09-01" ,"2024-09-06")
+get_stock_data("AAPL", "2024-09-01" ,"2024-09-06")
+get_stock_data("BBVA", "2024-09-01" ,"2024-09-06")  #This works
+
+
+```
+
+## Prepare the data
+
+```{r}
+
+
+#This will take in the data created above
+prepare_ml_data <- function(data) {
+  # Lag the pageviews (or else we will predict the past)
+  for (i in 1:7) {   #I think 7 days are enough
+    data[[paste0("Pageviews_lag", i)]] <- dplyr::lag(data$Pageviews, n = i)
+  }
+  
+  # Outcome will be 1 = UP up, 0 = DOWN or no change
+  data$Price_Change <- ifelse(dplyr::lead(data$Stock_Close) > data$Stock_Close, 1, 0)
+  
+  # Remove rows with NA values
+  data <- na.omit(data)
+  
+  return(data)
+}
+
+
+
+#Let's test it with our data
+
+wiki_data <- get_wiki_pageviews("Tesla, Inc.", "2024-01-01", "2024-03-01") #Make sure this is at least TWO months! (see below)
+stock_data <- get_stock_data("TSLA", "2024-01-01", "2024-03-01")
+combined_data <- merge(wiki_data, stock_data, by = "Date")
+
+# Apply prepare_ml_data to real data
+prepared_real_data <- prepare_ml_data(combined_data)
+print(prepared_real_data)
+
+
+```
+
+## Train and test the model.
+
+```{r}
+ 
+train_and_test <- function(data) {
+  # Use all rows except the last for training (I had to increase this or else the model fails!)
+  train_data <- data[1:(nrow(data) - 1), ]   
+  test_data <- data[nrow(data), ]  # The last row is the test set to test it
+  
+  # Force the outcome to factor (this crashed it earlier)
+  train_data$Price_Change <- as.factor(train_data$Price_Change)
+  
+  # Train logistic regression model
+  model <- train(
+    Price_Change ~ ., 
+    data = train_data[, c("Price_Change", paste0("Pageviews_lag", 1:7))],  #These are the VARIABLES, do NOT change to 1:nrow
+    method = "glm", 
+    family = "binomial",
+    trControl = trainControl(method = "none")  # Disable cross-validation or it crashes
+  )
+  
+  # Predict for the test day (last now)
+  prediction <- predict(model, newdata = test_data[, paste0("Pageviews_lag", 1:7), drop = FALSE])
+  
+  # Return the prediction and actual value
+  return(list(
+    prediction = prediction,
+    actual = test_data$Price_Change
+  ))
+}
+
+train_and_test(prepared_real_data) #Wow! actually actually predicted :)
+
+```
+
+## Run all the prior for some Wiki pages and tickers, and see how well it performs
+
+::: callout-note
+## Do NOT run the next part unless necessary, as it makes TEN requests to each of the APIs
+:::
+
+```{r}
+# stocks <- c("TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NFLX", "NVDA", "BRK-B", "JNJ")
+# wiki_pages <- c("Tesla, Inc.", "Apple_Inc.", "Microsoft", "Alphabet_Inc.", "Amazon_(company)", "Meta_Platforms", "Netflix", "Nvidia", "Berkshire_Hathaway", "Johnson_%26_Johnson")
+# start_date <- "2024-03-01"
+# end_date <- "2024-05-01"
+# 
+# # Loop through associations
+# results <- lapply(1:length(stocks), function(i) {
+#   stock <- stocks[i]
+#   wiki_page <- wiki_pages[i]
+#   
+#   # Pull data
+#   wiki_data <- get_wiki_pageviews(wiki_page, start_date, end_date)
+#   stock_data <- get_stock_data(stock, start_date, end_date)
+#   
+#   # Merge data
+#   combined_data <- merge(wiki_data, stock_data, by = "Date")
+#   
+#   # Prepare data
+#   prepared_data <- prepare_ml_data(combined_data)
+#   
+#   # Train and test
+#   train_and_test(prepared_data)
+# })
+# 
+# # Print results
+# results
+# 
+# # The model worked on 6/10
+
+
+```
+
+# Part 2
+
+```{r}
+# Define UI for the Shiny app
+# I HAVE AN EXTRA PARTENTHESIS SOMEWHERE AHHHH
+
+ui <- fluidPage(      #For a responsive web layout
+  titlePanel("Wikipedia & Stock Price Correlation"),     #This goes at the top of the app
+  
+#Add a description of the machine learning model
+fluidRow(
+  column(12,
+         h4("About This Tool"),
+         p("This tool uses a machine learning algorithm (logistic regression) to analyze the relationship 
+             between Wikipedia pageviews and stock price movements. It uses the number of Wikipedia pageviews 
+             for the past 7 days (lagged data) to predict whether the stock price will go up or down 
+             on the last day of the selected date range."),
+         div(
+           style = "background-color: #f2f2f2; padding: 10px; border-radius: 5px; text-align: center; font-weight: bold;",
+           "For best results, select a minimum range of 3 months."
+         ))),
+  
+  #This is where the user will input Wiki and stock -  For now let's stick to TESLA
+  sidebarLayout(
+    sidebarPanel(
+      textInput("stock", "Enter Stock Ticker (e.g., TSLA)", "TSLA"),
+      textInput("wiki_page", "Enter Wikipedia Page (e.g., Tesla, Inc.)", "Tesla, Inc."),
+      dateRangeInput("date_range", "Select Date Range",
+                     start = "2024-01-01", end = Sys.Date())
+    ),
+    
+    #This is  the output
+    mainPanel(
+      plotOutput("plot"),
+      textOutput("error"),
+      verbatimTextOutput("model_summary"),
+      uiOutput("prediction")  # Updated to handle dynamic banners
+    )
+  )
+)
+
+
+# Add the training function outside the server logic
+
+train_model <- function(data) {
+  predictors <- paste0("Pageviews_lag", 1:7)
+  train_control <- trainControl(method = "cv", number = 5)
+  
+  # Convert Price_Change to a factor
+  data$Price_Change <- as.factor(data$Price_Change)
+  
+  model <- train(
+    Price_Change ~ ., 
+    data = data[, c("Price_Change", predictors)], 
+    method = "glm", 
+    family = "binomial",
+    trControl = train_control
+  )
+ return(model)
+}
+
+
+###########################################
+##### And define the server logic #########
+############################################
+
+server <- function(input, output, session) {
+  # Reactive expression to get data based on user inputs
+  data <- reactive({
+    req(input$stock, input$wiki_page, input$date_range)
+    
+    # Fetch Wikipedia data
+    wiki_data <- get_wiki_pageviews(input$wiki_page, input$date_range[1], input$date_range[2])
+    if (is.null(wiki_data)) {
+      output$error <- renderText("Error: Unable to retrieve Wikipedia page views.")
+      return(NULL)
+    }
+    
+    # Fetch stock data
+    stock_data <- get_stock_data(input$stock, input$date_range[1], input$date_range[2])
+    if (is.null(stock_data)) {
+      output$error <- renderText("Error: Unable to retrieve stock data.")
+      return(NULL)
+    }
+    
+    # Merge and normalize data
+    combined_data <- merge(wiki_data, stock_data, by = "Date")
+    combined_data$Pageviews_norm <- (combined_data$Pageviews - min(combined_data$Pageviews)) /
+      (max(combined_data$Pageviews) - min(combined_data$Pageviews))
+    combined_data$Stock_Close_norm <- (combined_data$Stock_Close - min(combined_data$Stock_Close)) /
+      (max(combined_data$Stock_Close) - min(combined_data$Stock_Close))
+    
+    output$error <- renderText("")  # Clear error message
+    return(combined_data)
+  })
+  
+  # Reactive expression to prepare data
+  prepared_data <- reactive({
+    req(data())
+    prepare_ml_data(data())
+  })
+  
+  # Reactive expression to train the model
+  trained_model <- reactive({
+    req(prepared_data())
+    train_model(prepared_data())
+  })
+  
+  # Display model summary (I'VE MODIFIED THIS TO MAKE THE OUTPUT MORE SIMPLE!)
+output$model_summary <- renderPrint({
+  req(trained_model())
+  
+  # Get model details
+  model <- trained_model()
+  
+  # Display a simplified version of the model's key details
+  cat("Model Training Complete\n")
+  cat("Cross-validation Accuracy:", round(max(model$results$Accuracy, na.rm = TRUE), 3), "\n")
+  cat("Key Predictors:\n")
+  print(model$finalModel$coefficients)
+})
+
+  # Predict next day's price movement
+  output$prediction <- renderUI({
+    req(trained_model(), prepared_data())
+    
+    # Get the prediction
+    new_data <- prepared_data()[nrow(prepared_data()), paste0("Pageviews_lag", 1:7), drop = FALSE]
+    prediction <- predict(trained_model(), newdata = new_data)
+    
+    # Define message and color
+    if (prediction == 1) {
+      message <- "Predicted Price Movement: UP"
+      color <- "#d4edda"  # Light green
+      text_color <- "#155724"  # Dark green text
+    } else {
+      message <- "Predicted Price Movement: DOWN"
+      color <- "#f8d7da"  # Light red
+      text_color <- "#721c24"  # Dark red text
+    }
+    
+    # Create a styled banner
+    div(
+      style = paste(
+        "background-color:", color, ";",
+        "color:", text_color, ";",
+        "padding: 10px;",
+        "border-radius: 5px;",
+        "font-weight: bold;",
+        "text-align: center;"
+      ),
+      message
+      )
+    })
+  
+  # Plot output
+  output$plot <- renderPlot({
+    req(data())
+    combined_data <- data()
+    ggplot(combined_data, aes(x = Date)) +
+      geom_line(aes(y = Pageviews_norm, color = "Pageviews")) +
+      geom_line(aes(y = Stock_Close_norm, color = "Stock Price")) +
+      labs(
+        title = paste("Normalized Wikipedia Pageviews and Stock Price for", input$stock),
+        x = "Date",
+        y = "Normalized Scale (0-1)"
+      ) +
+      scale_color_manual(values = c("Pageviews" = "blue", "Stock Price" = "red")) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
+
+#rsconnect::deployApp("/Users/antoniobandala/Desktop/project4/")
+
+
+```
